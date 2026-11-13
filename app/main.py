@@ -11,6 +11,8 @@ from zipfile import BadZipFile
 from docx.opc.exceptions import PackageNotFoundError
 import pytesseract
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import Response
+from gtts import gTTS, gTTSError
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,10 @@ configure_tesseract()
 # --- Configuración de idiomas OCR ---
 DEFAULT_OCR_LANG = os.getenv("OCR_LANG", "spa+eng")
 SUPPORTED_LANGS = {"spa", "eng"}
+
+# Tesseract usa spa/eng; el motor de voz usa es/en.
+SUPPORTED_TTS_LANGS = {"es", "en"}
+MAX_TTS_CHARACTERS = 20_000
 
 
 def normalize_lang(lang: Optional[str]) -> str:
@@ -63,8 +69,8 @@ def run_ocr(image: Image.Image, lang: str) -> str:
 
 app = FastAPI(
     title="Microservicio de OCR y Lectura Accesible - Línea B",
-    description="API REST para extracción de texto (OCR, PyMuPDF, python-docx) y lectura accesible.",
-    version="0.3.0"
+    description="API REST para extraer texto de imágenes, PDF y DOCX y convertirlo a voz MP3 mediante gTTS (requiere Internet).",
+    version="0.4.0"
 )
 
 # MIME types y extensiones válidas
@@ -81,7 +87,7 @@ def read_root():
     return {
         "status": "ok",
         "servicio": "Línea B - OCR y Lectura Accesible",
-        "mensaje": "Endpoint funcional para imágenes, PDF y DOCX (Sprint 1)"
+        "mensaje": "Extracción de texto en /extract y generación de voz MP3 en /extract/audio"
     }
 
 
@@ -91,12 +97,8 @@ def health_check():
     return {"status": "healthy"}
 
 
-@app.post("/extract", status_code=status.HTTP_200_OK)
-def extract_text(
-    file: UploadFile = File(...),
-    lang: Optional[str] = Query(None, description="spa, eng o spa+eng"),
-):
-    # FastAPI ejecuta esta función síncrona en un hilo para no bloquear otras peticiones.
+def extract_document(file: UploadFile, lang: Optional[str] = None) -> dict:
+    """Extrae el texto una sola vez con la misma lógica para las dos rutas."""
     start_time = time.perf_counter()
     ocr_lang = normalize_lang(lang)
 
@@ -238,3 +240,86 @@ def extract_text(
             "pages_processed": len(extracted_pages)
         }
     }
+
+
+def synthesize_speech(text: str, tts_lang: str) -> bytes:
+    """Envía el texto a Google y devuelve los bytes del MP3, sin guardarlo en disco."""
+    if tts_lang not in SUPPORTED_TTS_LANGS:
+        raise HTTPException(status_code=400, detail="Idioma de voz no soportado. Usa es o en.")
+
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="No se encontró texto para convertir a voz.")
+    # El límite evita generar audios excesivos en una sola petición. No se trunca el texto.
+    if len(text) > MAX_TTS_CHARACTERS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"El texto supera el límite de {MAX_TTS_CHARACTERS} caracteres para voz. Divide el documento.",
+        )
+
+    try:
+        # gTTS divide el texto en fragmentos y escribe el MP3 completo en este búfer.
+        # El idioma ya se validó arriba; lang_check=False evita consultas adicionales.
+        # Los tiempos son por conexión y lectura, no un límite total del documento.
+        with io.BytesIO() as audio:
+            speech = gTTS(text=text, lang=tts_lang, lang_check=False, timeout=(5, 30))
+            speech.write_to_fp(audio)
+            audio_bytes = audio.getvalue()
+        if not audio_bytes:
+            raise HTTPException(status_code=503, detail="El servicio de voz devolvió un audio vacío.")
+        return audio_bytes
+    except gTTSError as exc:
+        # No incluimos texto del documento en el registro ni detalles del proveedor al cliente.
+        logger.warning("El servicio TTS no pudo completar la síntesis.")
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo generar el audio. Revisa la conexión a Internet o inténtalo más tarde.",
+        ) from exc
+    except (AssertionError, ValueError) as exc:
+        # Algunos textos, por ejemplo solo signos, quedan vacíos al prepararlos para voz.
+        raise HTTPException(status_code=400, detail="El texto no contiene contenido que se pueda leer en voz.") from exc
+
+
+@app.post("/extract", status_code=status.HTTP_200_OK)
+def extract_text(
+    file: UploadFile = File(...),
+    lang: Optional[str] = Query(None, description="Idioma OCR: spa, eng o spa+eng"),
+):
+    """Devuelve el texto y los metadatos del documento en JSON."""
+    # FastAPI ejecuta estas rutas síncronas en hilos para no bloquear otras peticiones.
+    return extract_document(file, lang)
+
+
+@app.post(
+    "/extract/audio",
+    response_class=Response,
+    responses={
+        200: {"description": "Audio MP3 del texto extraído.", "content": {"audio/mpeg": {"schema": {"type": "string", "format": "binary"}}}},
+        400: {"description": "Archivo, idioma o texto no válido."},
+        413: {"description": "El texto supera el límite de síntesis."},
+        503: {"description": "Motor OCR o servicio de voz no disponible."},
+    },
+)
+def extract_audio(
+    file: UploadFile = File(...),
+    lang: Optional[str] = Query(None, description="Idioma OCR: spa, eng o spa+eng"),
+    tts_lang: str = Query("es", description="Idioma de voz: es (español) o en (inglés). No traduce el texto."),
+) -> Response:
+    """Extrae el documento y envía el texto a Google para devolver su lectura en MP3."""
+    # Se valida antes del OCR para no procesar un documento con una voz no admitida.
+    if tts_lang not in SUPPORTED_TTS_LANGS:
+        raise HTTPException(status_code=400, detail="Idioma de voz no soportado. Usa es o en.")
+
+    document = extract_document(file, lang)
+    audio = synthesize_speech(document["extracted_text"], tts_lang)
+
+    # Se devuelve el archivo completo; el nombre fijo evita usar entradas del usuario
+    # en las cabeceras HTTP. No se crea una ruta pública ni se conserva el audio.
+    return Response(
+        content=audio,
+        media_type="audio/mpeg",
+        headers={
+            "Content-Disposition": 'attachment; filename="lectura.mp3"',
+            "Cache-Control": "no-store",
+        },
+    )
